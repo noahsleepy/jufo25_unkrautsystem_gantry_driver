@@ -18,6 +18,9 @@
 // Not-Aus (E-Stop) Pin
 #define ESTOP_PIN      25  
 
+// Laser Control Pin
+#define LASER_PIN      22  // Change this to your desired GPIO pin
+
 // Maximale Verfahrstrecke in mm
 #define MAX_TRAVEL_MM  220
 #define STEPS_PER_MM   80
@@ -40,6 +43,8 @@ void setup() {
     pinMode(ENDSTOP_X, INPUT_PULLUP);
     pinMode(ENDSTOP_Y, INPUT_PULLUP);
     pinMode(ESTOP_PIN, INPUT_PULLUP);
+    pinMode(LASER_PIN, OUTPUT);
+    digitalWrite(LASER_PIN, LOW); // Ensure laser is off at startup
 
     stepperX.setMaxSpeed(15000);
     stepperX.setAcceleration(12000);
@@ -106,7 +111,7 @@ void serialTask(void *pvParameters) {
     while (true) {
         if (Serial.available()) {
 
-            if(digitalRead(ESTOP_PIN) == HIGH && USE_ESTOP) {
+            if (digitalRead(ESTOP_PIN) == HIGH && USE_ESTOP) {
                 Serial.println("estop on");
                 vTaskDelay(1000 / portTICK_PERIOD_MS);  // Delay to avoid spam (1 second)
                 continue;
@@ -116,7 +121,6 @@ void serialTask(void *pvParameters) {
             command.trim();
             
             if (command == "home") {
-
                 Serial.println("homing...");
                 homeAxis(stepperX, ENDSTOP_X);
                 homeAxis(stepperY, ENDSTOP_Y);
@@ -128,6 +132,12 @@ void serialTask(void *pvParameters) {
                 targetX = x;
                 targetY = y;
                 newTargetAvailable = true;
+
+            } else if (command == "laser on") {
+                digitalWrite(LASER_PIN, HIGH);
+
+            } else if (command == "laser off") {
+                digitalWrite(LASER_PIN, LOW);
             }
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
