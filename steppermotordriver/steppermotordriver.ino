@@ -5,6 +5,11 @@
 #include <math.h>
 #include <Adafruit_NeoPixel.h>
 
+
+
+//--------------------------------------------------------
+// Configuration
+//--------------------------------------------------------
 // ESP32 Pins for X-Axis
 #define STEP_PIN_X     33  
 #define DIR_PIN_X      23  
@@ -15,10 +20,8 @@
 #define DIR_PIN_Y      27  
 #define ENDSTOP_Y      34  
 
-// Laser and LED Control Pins
+// Laser 
 #define LASER_PIN      22  
-#define LED_PIN        5  // Free pin for the WS2812 strip
-#define NUM_LEDS       65  
 
 // Home button pin
 #define HOME_BUTTON_PIN 4   
@@ -29,7 +32,6 @@
 
 AccelStepper stepperX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // Buffered coordinate storage
 float coordXBuffer[10], coordYBuffer[10];
@@ -44,14 +46,6 @@ float targetX = 0, targetY = 0;
 unsigned long lastPosCommandTime = 0;
 uint8_t laser_state = 0;
 
-//--------------------------------------------------------
-// LED control function
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-    for (int i = 0; i < NUM_LEDS; i++) {
-        strip.setPixelColor(i, strip.Color(r, g, b));
-    }
-    strip.show();
-}
 
 //--------------------------------------------------------
 // Homing function
@@ -172,16 +166,6 @@ void serialTask(void *pvParameters) {
                 }
             }
 
-            // LED control command: "laser R, G, B"
-            if (command.startsWith("led ")) {
-                int r, g, b;
-                if (sscanf(command.c_str(), "led %d, %d, %d", &r, &g, &b) == 3) {
-                    setLEDColor(r, g, b);
-                    Serial.printf("LEDs set to RGB(%d, %d, %d)\n", r, g, b);
-                    continue;
-                }
-            }
-
             // Invalid command
             Serial.println("Invalid command format!");
         }
@@ -280,7 +264,6 @@ void setup() {
     stepperY.setAcceleration(20000);
 
 
-    pinMode(LED_PIN, OUTPUT);
     strip.begin();
 
     Serial.println("ready");
