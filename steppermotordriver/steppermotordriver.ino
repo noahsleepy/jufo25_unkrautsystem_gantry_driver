@@ -5,275 +5,276 @@
 #include <math.h>
 #include <Adafruit_NeoPixel.h>
 
-
-
 //--------------------------------------------------------
 // Configuration
 //--------------------------------------------------------
-// ESP32 Pins for X-Axis
 #define STEP_PIN_X     33  
 #define DIR_PIN_X      23  
 #define ENDSTOP_X      32  
 
-// ESP32 Pins for Y-Axis
 #define STEP_PIN_Y     26  
 #define DIR_PIN_Y      27  
 #define ENDSTOP_Y      34  
 
-// Laser 
 #define LASER_PIN      22  
-
-// Home button pin
 #define HOME_BUTTON_PIN 4   
 
 #define MAX_TRAVEL_MM  220
 #define STEPS_PER_MM   80
-#define MAX_STEPS      (MAX_TRAVEL_MM * STEPS_PER_MM)
 
+// Create steppers (DRIVER type)
 AccelStepper stepperX(AccelStepper::DRIVER, STEP_PIN_X, DIR_PIN_X);
 AccelStepper stepperY(AccelStepper::DRIVER, STEP_PIN_Y, DIR_PIN_Y);
 
-// Buffered coordinate storage
-float coordXBuffer[10], coordYBuffer[10];
-int coordCount = 0;
-bool homingActive = false;
-bool calibrationMode = false;
-int calibrationStep = 0;
-
-// Laser and movement control
-bool newTargetAvailable = false;
-float targetX = 0, targetY = 0;
-unsigned long lastPosCommandTime = 0;
+// Global motion control variables
+volatile float targetX = 0, targetY = 0;
+volatile bool inBlockingMotion = false;  // disables the motion task during blocking routines
 uint8_t laser_state = 0;
-
-
-//--------------------------------------------------------
-// Homing function
-void homeAxis(AccelStepper &stepper, int endstopPin) {
-    homingActive = true;
-    stepper.setSpeed(-1600);
-    while (digitalRead(endstopPin) == LOW) {
-        stepper.runSpeed();
-    }
-    delay(200);
-    
-    stepper.setSpeed(400);
-    stepper.move(200);
-    while (stepper.distanceToGo() > 0) {
-        stepper.run();
-    }
-    delay(200);
-
-    stepper.setSpeed(-200);
-    while (digitalRead(endstopPin) == LOW) {
-        stepper.runSpeed();
-    }
-
-    stepper.move(500);
-    stepper.runToPosition();
-    stepper.setCurrentPosition(0);
-    homingActive = false;
-}
+bool isHoming = false;  // set true during homing
+bool isCalibrating = false;
+bool isHomed = false;   // remains false until homing is performed
 
 //--------------------------------------------------------
-// Laser control function
+// Laser control
+//--------------------------------------------------------
 void updateLaserState(bool state) {
-    digitalWrite(LASER_PIN, state ? HIGH : LOW);
-    if (laser_state != state) {
-        Serial.println(state ? "Laser ON" : "Laser OFF");
-        laser_state = state;
-    }
+  digitalWrite(LASER_PIN, state ? HIGH : LOW);
 }
 
 //--------------------------------------------------------
-// Move steppers to a position
-void moveToPosition(float x, float y) {
-    stepperX.moveTo(x * STEPS_PER_MM);
-    stepperY.moveTo(y * STEPS_PER_MM);
-    while (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
-        stepperX.run();
-        stepperY.run();
-    }
+// Blocking move (used in calibration, if needed)
+//--------------------------------------------------------
+void moveToPositionBlocking(float x, float y) {
+  stepperX.moveTo(x * STEPS_PER_MM);
+  stepperY.moveTo(y * STEPS_PER_MM);
+  while (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
+    stepperX.run();
+    stepperY.run();
+  }
 }
 
 //--------------------------------------------------------
-// Process Buffered Coordinates
-void processBufferedCoordinates() {
-    if (coordCount < 10) return;  
-
-    float sumX = 0, sumY = 0;
-    for (int i = 0; i < 10; i++) {
-        sumX += coordXBuffer[i];
-        sumY += coordYBuffer[i];
-    }
-    float centerX = sumX / 10;
-    float centerY = sumY / 10;
-
-    // Validate all coordinates are within 30mm of the center
-    for (int i = 0; i < 10; i++) {
-        float dx = coordXBuffer[i] - centerX;
-        float dy = coordYBuffer[i] - centerY;
-        if (sqrt(dx * dx + dy * dy) > 30.0) {
-            coordCount = 0; // Reset buffer
-            return;
-        }
-    }
-
-    // Move to calculated center
-    Serial.printf("moving to %.2f, %.2f\n", centerX, centerY);
-    moveToPosition(centerX, centerY);
-    updateLaserState(true);
-    delay(2000); // Laser ON for 2 sec
-
-    // Return to home position
-    updateLaserState(false);
-    moveToPosition(0, 0);
-    coordCount = 0; // Reset buffer
+// Fast homing function for one axis (blocking)
+//--------------------------------------------------------
+void homeAxis(AccelStepper &stepper, int endstopPin) {
+  // Increase speed for homing
+  stepper.setSpeed(-3000);
+  // Move toward endstop quickly
+  while (digitalRead(endstopPin) == LOW) {
+    stepper.runSpeed();
+  }
+  delay(50); // reduced delay
+  // Back off a bit and then approach slowly for precision
+  stepper.setSpeed(600);
+  stepper.move(150);  
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+  }
+  delay(50);
+  // Final approach
+  stepper.setSpeed(-300);
+  while (digitalRead(endstopPin) == LOW) {
+    stepper.runSpeed();
+  }
+  stepper.move(300);
+  stepper.runToPosition();
+  stepper.setCurrentPosition(0);
 }
 
 //--------------------------------------------------------
-// Serial processing
-void serialTask(void *pvParameters) {
-    while (true) {
-        if (Serial.available()) {
-            String command = Serial.readStringUntil('\n');
-            command.trim();
-            
-            // Coordinate format validation: "123, 456"
-            int commaIndex = command.indexOf(',');
-            if (commaIndex > 0 && command.length() > commaIndex + 1) {
-                bool validFormat = true;
-                for (int i = 0; i < command.length(); i++) {
-                    if (i != commaIndex && !isDigit(command[i]) && command[i] != ' ') {
-                        validFormat = false;
-                        break;
-                    }
-                }
-                if (validFormat) {
-                    float x, y;
-                    sscanf(command.c_str(), "%f, %f", &x, &y);
-                    if (!homingActive && !calibrationMode) {
-                        coordXBuffer[coordCount] = x;
-                        coordYBuffer[coordCount] = y;
-                        coordCount++;
-                        Serial.printf("[%i/10] added %f, %f\n", coordCount, x, y);
-
-                        if (coordCount == 10) {
-                            processBufferedCoordinates();
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            // Invalid command
-            Serial.println("Invalid command format!");
-        }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-}
-
-
+// Calibration routine (if needed via long button press)
 //--------------------------------------------------------
-// Calibration function
 void calibrationRoutine() {
-    float positions[4][2] = { {0, 0}, {220, 0}, {220, 220}, {0, 220} };
-
-    if (calibrationStep < 4) {
-        moveToPosition(positions[calibrationStep][0], positions[calibrationStep][1]);
-        
-        // Wait for button press before continuing
-        Serial.printf("Waiting for button press at position: %.2f, %.2f\n", 
-                      positions[calibrationStep][0], positions[calibrationStep][1]);
-        
-        while (digitalRead(HOME_BUTTON_PIN) == HIGH) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);  // Small delay to avoid busy waiting
-        }
-
-        // Wait for button release
-        while (digitalRead(HOME_BUTTON_PIN) == LOW) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-
-        calibrationStep++;  // Move to next position after button press
-    } else {
-        moveToPosition(0, 0);
-        updateLaserState(false);
-        calibrationStep = 0;
-        calibrationMode = false;
-        Serial.println("Calibration complete.");
+  isCalibrating = true;
+  float positions[4][2] = { {0, 0}, {220, 0}, {220, 220}, {0, 220} };
+  static int calibrationStep = 0;
+  if (calibrationStep < 4) {
+    moveToPositionBlocking(positions[calibrationStep][0], positions[calibrationStep][1]);
+    while (digitalRead(HOME_BUTTON_PIN) == HIGH) {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
     }
+    while (digitalRead(HOME_BUTTON_PIN) == LOW) {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    calibrationStep++;
+  } else {
+    moveToPositionBlocking(0, 0);
+    updateLaserState(false);
+    isCalibrating = false;
+  }
+  
 }
 
+//--------------------------------------------------------
+// Fast, non-blocking motion task
+//--------------------------------------------------------
+void motionTask(void *pvParameters) {
+  while (true) {
+    if (!inBlockingMotion) {
+      stepperX.run();
+      stepperY.run();
+    }
+    // Yield control without delaying (vTaskDelay(0) forces a yield)
+    vTaskDelay(0);
+  }
+}
+
+//--------------------------------------------------------
+// Serial command processing
+//--------------------------------------------------------
+void serialTask(void *pvParameters) {
+  while (true) {
+    if (Serial.available()) {
+      String command = Serial.readStringUntil('\n');
+      command.trim();
+      if (command.length() == 0)
+        continue;
+      
+      if (command.equalsIgnoreCase("on")) {
+        updateLaserState(true);
+      } 
+      else if (command.equalsIgnoreCase("off")) {
+        updateLaserState(false);
+      }
+      else if (command.equalsIgnoreCase("home")) {
+        inBlockingMotion = true;
+        isHoming = true;
+        Serial.println("Homing triggered");
+        homeAxis(stepperX, ENDSTOP_X);
+        homeAxis(stepperY, ENDSTOP_Y);
+        stepperX.setCurrentPosition(0);
+        stepperY.setCurrentPosition(0);
+        targetX = 0;
+        targetY = 0;
+        isHoming = false;
+        isHomed = true;
+        inBlockingMotion = false;
+        Serial.println("Homing complete");
+      }
+      else { // Expect coordinate command: "x y"
+        float x, y;
+        int parsed = sscanf(command.c_str(), "%f %f", &x, &y);
+        if (parsed == 2) {
+          if (x >= 0 && x <= MAX_TRAVEL_MM && y >= 0 && y <= MAX_TRAVEL_MM) {
+            targetX = x;
+            targetY = y;
+            stepperX.moveTo(targetX * STEPS_PER_MM);
+            stepperY.moveTo(targetY * STEPS_PER_MM);
+          }
+          else {
+            Serial.println("Coordinates out of range!");
+          }
+        }
+        else {
+          Serial.println("Invalid command format!");
+        }
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
 
 //--------------------------------------------------------
 // Home button task
+//--------------------------------------------------------
 void homeButtonTask(void *pvParameters) {
-    unsigned long pressStartTime = 0;
-    bool buttonPressed = false;
-
-    while (true) {
-        if (digitalRead(HOME_BUTTON_PIN) == LOW) {
-            if (!buttonPressed) {
-                pressStartTime = millis();
-                buttonPressed = true;
-            } else if (millis() - pressStartTime >= 2000) {
-                updateLaserState(true);
-                delay(500);
-                updateLaserState(false);
-                delay(500);
-            }
-        } else {
-            if (buttonPressed) {
-                if (millis() - pressStartTime >= 2000) {
-                    calibrationMode = true;
-                    calibrationStep = 0;
-                    updateLaserState(true);
-                } else {
-                    Serial.println("Homing triggered");
-                    homeAxis(stepperX, ENDSTOP_X);
-                    homeAxis(stepperY, ENDSTOP_Y);
-                    Serial.println("Homing complete");
-                }
-                buttonPressed = false;
-            }
+  unsigned long pressStartTime = 0;
+  bool buttonPressed = false;
+  
+  while (true) {
+    if (digitalRead(HOME_BUTTON_PIN) == LOW) {
+      if (!buttonPressed) {
+        pressStartTime = millis();
+        buttonPressed = true;
+      }
+      else if (millis() - pressStartTime >= 2000) {
+        updateLaserState(true);
+        delay(200);
+        updateLaserState(false);
+        delay(200);
+      }
+    } 
+    else {
+      if (buttonPressed) {
+        if (millis() - pressStartTime >= 2000) {
+          isCalibrating = true;
+          inBlockingMotion = true;
+          updateLaserState(true);
+        } 
+        else {
+          inBlockingMotion = true;
+          isHoming = true;
+          Serial.println("Homing triggered");
+          homeAxis(stepperX, ENDSTOP_X);
+          homeAxis(stepperY, ENDSTOP_Y);
+          stepperX.setCurrentPosition(0);
+          stepperY.setCurrentPosition(0);
+          targetX = 0;
+          targetY = 0;
+          isHoming = false;
+          isHomed = true;
+          Serial.println("Homing complete");
+          inBlockingMotion = false;
         }
-
-        if (calibrationMode) {
-            calibrationRoutine();
-        }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        buttonPressed = false;
+      }
     }
+    
+    if (isCalibrating) {
+      calibrationRoutine();
+    }
+    
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
 
 //--------------------------------------------------------
-// Setup function
+// Position feedback task (rounded integers + status)
+//--------------------------------------------------------
+void positionFeedbackTask(void *pvParameters) {
+  while (true) {
+    int posX = round(stepperX.currentPosition() / (float)STEPS_PER_MM);
+    int posY = round(stepperY.currentPosition() / (float)STEPS_PER_MM);
+    if (isHoming || isCalibrating) {
+      Serial.printf("%d %d busy\n", posX, posY);
+    } else if (!isHomed) {
+      Serial.printf("%d %d unhomed\n", posX, posY);
+    } else {
+      Serial.printf("%d %d\n", posX, posY);
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+//--------------------------------------------------------
+// Setup
+//--------------------------------------------------------
 void setup() {
-    delay(1000);
-    Serial.begin(115200);
+  delay(1000);
+  Serial.begin(115200);
 
-    pinMode(ENDSTOP_X, INPUT_PULLUP);
-    pinMode(ENDSTOP_Y, INPUT_PULLUP);
-    pinMode(LASER_PIN, OUTPUT);
-    digitalWrite(LASER_PIN, LOW);
-    pinMode(HOME_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ENDSTOP_X, INPUT_PULLUP);
+  pinMode(ENDSTOP_Y, INPUT_PULLUP);
+  pinMode(LASER_PIN, OUTPUT);
+  digitalWrite(LASER_PIN, LOW);
+  pinMode(HOME_BUTTON_PIN, INPUT_PULLUP);
 
-    stepperX.setMaxSpeed(20000);
-    stepperX.setAcceleration(20000);
-    stepperY.setMaxSpeed(20000);
-    stepperY.setAcceleration(20000);
+  stepperX.setMaxSpeed(20000);
+  stepperX.setAcceleration(20000);
+  stepperY.setMaxSpeed(20000);
+  stepperY.setAcceleration(20000);
 
+  Serial.println("ready");
 
-    strip.begin();
-
-    Serial.println("ready");
-
-    xTaskCreatePinnedToCore(serialTask, "SerialTask", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(homeButtonTask, "HomeButtonTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(homeButtonTask, "HomeButtonTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(positionFeedbackTask, "PositionFeedbackTask", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(motionTask, "MotionTask", 2048, NULL, 1, NULL, 1);
 }
 
 //--------------------------------------------------------
-// Main loop does nothing
+// Main loop (empty: tasks handle everything)
+//--------------------------------------------------------
 void loop() {
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
